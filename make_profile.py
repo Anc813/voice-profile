@@ -20,11 +20,9 @@ median + P5-P95 pitch, voiced-only formants, dB/oct spectral tilt, 50 Hz floor.
 """
 
 import argparse
-import io
 import math
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -206,24 +204,17 @@ def extract_voice_metrics(sound: parselmouth.Sound, pitch: parselmouth.Pitch) ->
 
 # ── audio helpers ───────────────────────────────────────────────────────────
 
-def load_sound(audio_path: Path) -> parselmouth.Sound:
-    """
-    Build a parselmouth.Sound with no temporary files.
-
-    wav/mp3 parselmouth reads natively (native sample rate / channels — kept so
-    analysis is unchanged). Everything else is decoded by ffmpeg straight to a
-    16-bit / 44100 Hz / mono PCM stream on stdout and rebuilt in memory. That
-    stream is byte-for-byte identical to the old temp-WAV path (pcm_s16le),
-    since int16/32768 reproduces exactly what Praat reads back from such a WAV.
-    """
+def ensure_wav(audio_path: Path) -> tuple[Path, bool]:
+    """Decode to WAV if parselmouth can't read the format directly."""
     if audio_path.suffix.lower() in (".wav", ".mp3"):
-        return parselmouth.Sound(str(audio_path))
-    proc = subprocess.run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(audio_path),
-        "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", "pipe:1",
-    ], stdout=subprocess.PIPE, check=True, timeout=300)
-    samples = np.frombuffer(proc.stdout, dtype="<i2").astype(np.float64) / 32768.0
-    return parselmouth.Sound(samples, sampling_frequency=44100)
+        return audio_path, False
+    wav = audio_path.with_suffix(".wav")
+    if not wav.exists():
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(audio_path),
+            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", str(wav),
+        ], check=True, timeout=300)
+    return wav, True
 
 
 # ── shared analysis ─────────────────────────────────────────────────────────
@@ -325,8 +316,10 @@ def _draw_stats_grid(ax, metrics, voiced_ratio, valid_pitches):
                 color=vcolor, fontsize=STATS_FONTSIZE, family="monospace", fontweight="bold")
 
 
-def render_static(data: dict) -> bytes:
-    """Render the v9 dashboard PNG straight to memory. Returns the PNG bytes."""
+def render_static(audio_path: Path, data: dict) -> Path:
+    """Render the v9 dashboard PNG. Returns the image path."""
+    stem = audio_path.stem
+    img_path = HERE / f"_{stem}_tmp.png"
     duration = data["duration"]
     metrics = data["metrics"]
 
@@ -379,30 +372,26 @@ def render_static(data: dict) -> bytes:
             handlelength=0.7, handletextpad=0.3, columnspacing=0.8,
         )
     ax.set_xlim(0, duration)
-    buf = io.BytesIO()
-    fig.savefig(buf, dpi=150, format="png")
+    fig.savefig(str(img_path), dpi=150, format="png")
     plt.close(fig)
-    return buf.getvalue()
+    return img_path
 
 
-def build_video_static(video_path: Path, png: bytes, audio_path: Path, duration: float):
-    # The single dashboard frame is fed on stdin and looped in-filter (a plain
-    # -loop 1 needs a seekable file, which a pipe is not).
+def build_video_static(video_path: Path, img_path: Path, audio_path: Path, duration: float):
     cmd = [
         "ffmpeg", "-y",
-        "-f", "image2pipe", "-framerate", "1", "-i", "pipe:0",
+        "-loop", "1", "-framerate", "1", "-i", str(img_path),
         "-i", str(audio_path),
-        "-filter_complex", "[0:v]loop=loop=-1:size=1:start=0,fps=1[v]",
         "-c:v", "libsvtav1",
         "-svtav1-params", "preset=8:crf=35:scd=0:keyint=1000:tune=0",
         "-pix_fmt", "yuv420p",
         "-c:a", "libopus", "-b:a", "64k",
-        "-map", "[v]", "-map", "1:a:0",
+        "-map", "0:v:0", "-map", "1:a:0",
         "-t", f"{duration:.3f}", "-shortest",
         "-movflags", "+faststart",
         str(video_path),
     ]
-    subprocess.run(cmd, input=png, capture_output=True, check=True, timeout=300)
+    subprocess.run(cmd, capture_output=True, check=True, timeout=300)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -632,14 +621,17 @@ def process_one(audio_path: Path, scroll: bool, window: int, fps: int):
         return
 
     print(f"  {stem}")
-    sound = load_sound(audio_path)
+    wav_path, is_temp_wav = ensure_wav(audio_path)
+
+    sound = parselmouth.Sound(str(wav_path))
     data = analyse(sound)
     duration = data["duration"]
 
     if not scroll:
-        # ── static (v9) — fully in-memory, no temp files ──
-        png = render_static(data)
-        build_video_static(video_path, png, audio_path, duration)
+        # ── static (v9) ──
+        img_path = render_static(audio_path, data)
+        build_video_static(video_path, img_path, audio_path, duration)
+        img_path.unlink(missing_ok=True)
     else:
         # ── scroll (v6, v9 metrics) ──
         global FPS, WINDOW_SECONDS
@@ -655,18 +647,19 @@ def process_one(audio_path: Path, scroll: bool, window: int, fps: int):
             mode = "scroll"
         strip_w = round(duration * pps)
 
+        chrome_png = HERE / f"_{stem}_chrome.png"
+        strip_png = HERE / f"_{stem}_strip.png"
         print(f"    {duration:.1f}s {mode} strip={strip_w}px @ {fps}fps")
 
-        # chrome / strip / tiles are still files (ffmpeg needs multiple image
-        # inputs + hstack), but they live in the system temp dir — which on this
-        # box is a RAM disk (A:\temp) — so they never touch the project folder
-        # and are auto-removed even on crash.
-        with tempfile.TemporaryDirectory(prefix="vp10_") as td:
-            chrome_png = Path(td) / f"{stem}_chrome.png"
-            strip_png = Path(td) / f"{stem}_strip.png"
-            build_chrome(chrome_png, audio_path.name, data)
-            n_tiles = build_strip(strip_png, strip_w, pps, data, visible_span)
-            build_video_scroll(video_path, chrome_png, strip_png, audio_path, strip_w, pps, duration)
+        build_chrome(chrome_png, audio_path.name, data)
+        n_tiles = build_strip(strip_png, strip_w, pps, data, visible_span)
+        build_video_scroll(video_path, chrome_png, strip_png, audio_path, strip_w, pps, duration)
+
+        chrome_png.unlink(missing_ok=True)
+        strip_png.unlink(missing_ok=True)
+
+    if is_temp_wav and wav_path.exists():
+        wav_path.unlink()
 
     size_mb = video_path.stat().st_size / 1024 / 1024
     print(f"    -> {video_path.name}  ({duration:.1f}s, {size_mb:.1f} MB)")
